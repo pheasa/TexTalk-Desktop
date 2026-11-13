@@ -36,6 +36,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 
@@ -450,6 +451,11 @@ QPushButton.TableRemoveBtn:hover {
     border-color: #f43f5e;
     color: #ffffff;
 }
+QPushButton.TableRemoveBtn:disabled {
+    background-color: #111827;
+    border-color: #1f2937;
+    color: #475569;
+}
 
 /* Primary Indigo Action Button */
 QPushButton#PrimaryButton {
@@ -615,6 +621,13 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 # ==============================================================================
 # 4. DATA MODELS & TASK DEFINITION
 # ==============================================================================
+class TaskStatus(str, Enum):
+    PENDING = "Pending"
+    PROCESSING = "Processing"
+    COMPLETED = "Completed"
+    FAILED = "Failed"
+
+
 @dataclass
 class SynthesisTask:
     task_id: str
@@ -623,7 +636,7 @@ class SynthesisTask:
     script_text: str
     voice_instruction: str
     reference_audio: Optional[str]
-    status: str = "Pending"  # "Pending", "Processing", "Completed", "Failed"
+    status: str = TaskStatus.PENDING.value
     progress: int = 0         # 0 to 100
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
     output_path: Optional[str] = None
@@ -837,7 +850,7 @@ class LocalDatabaseManager:
                     item.get("script_text") or "",
                     item.get("voice_instruction") or "",
                     item.get("reference_audio"),
-                    item.get("status") or "Failed",
+                    item.get("status") or TaskStatus.FAILED.value,
                     int(item.get("progress") or 0),
                     item.get("created_at") or "",
                     out_path,
@@ -923,7 +936,10 @@ class LocalDatabaseManager:
         with self._lock:
             if self._conn is None:
                 return
-            self._conn.execute("DELETE FROM tasks WHERE status IN ('Completed', 'Failed')")
+            self._conn.execute(
+                "DELETE FROM tasks WHERE status IN (?, ?)",
+                (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value),
+            )
             self._conn.commit()
             self._save_encrypted()
 
@@ -1358,7 +1374,7 @@ class VoxCPMModelManager:
         sf.write(output_file_path, full_audio, target_sr, subtype="PCM_16")
 
         if progress_callback:
-            progress_callback(task.task_id, 100, "Completed")
+            progress_callback(task.task_id, 100, TaskStatus.COMPLETED.value)
 
         return output_file_path
 
@@ -1506,11 +1522,18 @@ class QueueWorker(QThread):
         self.task_queue: queue.Queue[SynthesisTask] = queue.Queue()
         self._is_running: bool = True
         self.current_task: Optional[SynthesisTask] = None
+        self._cancel_lock = threading.Lock()
+        self._cancelled_task_ids: set[str] = set()
         self.model_manager = VoxCPMModelManager.get_instance()
 
     def add_task(self, task: SynthesisTask) -> None:
         self.task_queue.put(task)
-        self.task_status_changed.emit(task.task_id, "Pending", "Queued")
+        self.task_status_changed.emit(task.task_id, TaskStatus.PENDING.value, "Queued")
+
+    def cancel_queued_task(self, task_id: str) -> None:
+        """Marks a queued task as cancelled so it is skipped before synthesis starts."""
+        with self._cancel_lock:
+            self._cancelled_task_ids.add(task_id)
 
     def stop(self) -> None:
         self._is_running = False
@@ -1534,14 +1557,20 @@ class QueueWorker(QThread):
             if task is None or not self._is_running:
                 break
 
+            with self._cancel_lock:
+                if task.task_id in self._cancelled_task_ids:
+                    self._cancelled_task_ids.discard(task.task_id)
+                    self.task_queue.task_done()
+                    continue
+
             self.current_task = task
-            task.status = "Processing"
-            self.task_status_changed.emit(task.task_id, "Processing", "Initializing...")
+            task.status = TaskStatus.PROCESSING.value
+            self.task_status_changed.emit(task.task_id, TaskStatus.PROCESSING.value, "Initializing...")
 
             try:
                 # Ensure model weights are ready
                 def on_model_status(msg: str):
-                    self.task_status_changed.emit(task.task_id, "Processing", msg)
+                    self.task_status_changed.emit(task.task_id, TaskStatus.PROCESSING.value, msg)
 
                 self.model_manager.ensure_model_ready(status_callback=on_model_status)
 
@@ -1551,18 +1580,18 @@ class QueueWorker(QThread):
                     progress_callback=lambda tid, pct, txt: self.progress_changed.emit(tid, pct, txt)
                 )
 
-                task.status = "Completed"
+                task.status = TaskStatus.COMPLETED.value
                 task.progress = 100
                 task.output_path = output_path
-                self.task_status_changed.emit(task.task_id, "Completed", "Done")
+                self.task_status_changed.emit(task.task_id, TaskStatus.COMPLETED.value, "Done")
                 self.task_finished.emit(task.task_id, output_path)
 
             except Exception as e:
                 err_msg = str(e)
                 print(f"[QueueWorker] Task {task.task_id} failed: {err_msg}")
-                task.status = "Failed"
+                task.status = TaskStatus.FAILED.value
                 task.error_message = err_msg
-                self.task_status_changed.emit(task.task_id, "Failed", err_msg)
+                self.task_status_changed.emit(task.task_id, TaskStatus.FAILED.value, err_msg)
                 self.task_failed.emit(task.task_id, err_msg)
             finally:
                 self.task_queue.task_done()
@@ -1573,7 +1602,7 @@ class QueueWorker(QThread):
 # ==============================================================================
 class StatusBadge(QFrame):
     """Sleek pill-shaped badge displaying task state."""
-    def __init__(self, status: str = "Pending", parent=None):
+    def __init__(self, status: str = TaskStatus.PENDING.value, parent=None):
         super().__init__(parent)
         self.status = status
         self.layout = QHBoxLayout(self)
@@ -1594,13 +1623,13 @@ class StatusBadge(QFrame):
         self.text_label.setText(status)
 
         # Style colors per theme requirements
-        if status == "Completed":
+        if status == TaskStatus.COMPLETED.value:
             # Emerald green
             bg, border, text_color = "#064e3b", "#059669", "#34d399"
-        elif status == "Processing":
+        elif status == TaskStatus.PROCESSING.value:
             # Indigo / Blue
             bg, border, text_color = "#1e1b4b", "#4f46e5", "#818cf8"
-        elif status == "Failed":
+        elif status == TaskStatus.FAILED.value:
             # Rose / Red
             bg, border, text_color = "#4c0519", "#e11d48", "#fb7185"
         else:
@@ -1776,23 +1805,25 @@ class TextalkMainWindow(QMainWindow):
 
     def _load_persisted_tasks(self) -> None:
         for task in self.db.load_all_tasks():
-            if task.status in ("Pending", "Processing"):
-                task.status = "Failed"
+            if task.status in (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value):
+                task.status = TaskStatus.FAILED.value
                 task.error_message = task.error_message or "Interrupted before completion."
                 self.db.upsert_task(task)
             self.tasks[task.task_id] = task
             self._insert_table_row(task)
-            if task.status == "Completed":
+            if task.status in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value):
                 row = self._find_row_by_task_id(task.task_id)
                 if row is not None:
-                    action_widget = self.table.cellWidget(row, 5)
-                    if action_widget:
-                        play_btn = action_widget.findChild(QPushButton, f"play_{task.task_id}")
-                        if play_btn:
-                            play_btn.setEnabled(True)
-                        folder_btn = action_widget.findChild(QPushButton, f"folder_{task.task_id}")
-                        if folder_btn:
-                            folder_btn.setEnabled(True)
+                    self._set_row_remove_enabled(row, task.task_id, False)
+                    if task.status == TaskStatus.COMPLETED.value:
+                        action_widget = self.table.cellWidget(row, 5)
+                        if action_widget:
+                            play_btn = action_widget.findChild(QPushButton, f"play_{task.task_id}")
+                            if play_btn:
+                                play_btn.setEnabled(True)
+                            folder_btn = action_widget.findChild(QPushButton, f"folder_{task.task_id}")
+                            if folder_btn:
+                                folder_btn.setEnabled(True)
         self._update_queue_badge()
 
     def resizeEvent(self, event) -> None:
@@ -2494,16 +2525,25 @@ class TextalkMainWindow(QMainWindow):
         folder_btn.clicked.connect(lambda checked=False, tid=task_id: self._on_open_task_folder_clicked(tid))
         layout.addWidget(folder_btn)
 
-        # Remove Button
+        # Remove Button (only enabled while task is queued / Pending)
         remove_btn = QPushButton("✕", container)
         remove_btn.setObjectName(f"remove_{task_id}")
         remove_btn.setProperty("class", "TableRemoveBtn")
         remove_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        remove_btn.setToolTip("Remove task from history")
+        remove_btn.setToolTip("Delete task from queue")
+        task = self.tasks.get(task_id)
+        remove_btn.setEnabled(task is None or task.status == TaskStatus.PENDING.value)
         remove_btn.clicked.connect(lambda checked=False, tid=task_id: self._on_remove_task_clicked(tid))
         layout.addWidget(remove_btn)
 
         return container
+
+    def _set_row_remove_enabled(self, row: int, task_id: str, enabled: bool) -> None:
+        action_widget = self.table.cellWidget(row, 5)
+        if action_widget:
+            remove_btn = action_widget.findChild(QPushButton, f"remove_{task_id}")
+            if remove_btn:
+                remove_btn.setEnabled(enabled)
 
     def _find_row_by_task_id(self, task_id: str) -> Optional[int]:
         # Identify row by task_id in actions widget
@@ -2519,7 +2559,10 @@ class TextalkMainWindow(QMainWindow):
 
     def _update_queue_badge(self) -> None:
         total = len(self.tasks)
-        pending = sum(1 for t in self.tasks.values() if t.status in ("Pending", "Processing"))
+        pending = sum(
+            1 for t in self.tasks.values()
+            if t.status in (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value)
+        )
         if pending > 0:
             self.queue_badge.setText(f"{total} Tasks ({pending} active)")
             if hasattr(self, "tab_queue_btn"):
@@ -2547,6 +2590,7 @@ class TextalkMainWindow(QMainWindow):
             badge = self.table.cellWidget(row, 2)
             if isinstance(badge, StatusBadge):
                 badge.set_status(status)
+            self._set_row_remove_enabled(row, task_id, status == TaskStatus.PENDING.value)
 
         self.action_status_lbl.setText(f"Status: {message}")
         self.action_status_lbl.setStyleSheet("color: #e2e8f0;")
@@ -2571,7 +2615,7 @@ class TextalkMainWindow(QMainWindow):
     def _on_task_finished(self, task_id: str, output_path: str) -> None:
         if task_id in self.tasks:
             task = self.tasks[task_id]
-            task.status = "Completed"
+            task.status = TaskStatus.COMPLETED.value
             task.progress = 100
             task.output_path = output_path
             task.output_folder = os.path.dirname(output_path)
@@ -2582,7 +2626,7 @@ class TextalkMainWindow(QMainWindow):
             # Update status badge widget
             badge = self.table.cellWidget(row, 2)
             if isinstance(badge, StatusBadge):
-                badge.set_status("Completed")
+                badge.set_status(TaskStatus.COMPLETED.value)
 
             prog_widget = self.table.cellWidget(row, 3)
             if prog_widget:
@@ -2604,6 +2648,7 @@ class TextalkMainWindow(QMainWindow):
                     folder_btn.setProperty("class", "TableActionBtn")
                     folder_btn.style().unpolish(folder_btn)
                     folder_btn.style().polish(folder_btn)
+            self._set_row_remove_enabled(row, task_id, False)
 
         self.action_status_lbl.setText(f"Task completed: {os.path.basename(output_path)}")
         self.action_status_lbl.setStyleSheet("color: #10b981;")
@@ -2613,7 +2658,7 @@ class TextalkMainWindow(QMainWindow):
     def _on_task_failed(self, task_id: str, err_msg: str) -> None:
         if task_id in self.tasks:
             task = self.tasks[task_id]
-            task.status = "Failed"
+            task.status = TaskStatus.FAILED.value
             task.error_message = err_msg
             self.db.upsert_task(task)
 
@@ -2621,7 +2666,8 @@ class TextalkMainWindow(QMainWindow):
         if row is not None:
             badge = self.table.cellWidget(row, 2)
             if isinstance(badge, StatusBadge):
-                badge.set_status("Failed")
+                badge.set_status(TaskStatus.FAILED.value)
+            self._set_row_remove_enabled(row, task_id, False)
 
         self.action_status_lbl.setText(f"Synthesis failed: {err_msg}")
         self.action_status_lbl.setStyleSheet("color: #f43f5e;")
@@ -2672,15 +2718,17 @@ class TextalkMainWindow(QMainWindow):
             open_folder_and_select_file(folder)
 
     def _on_remove_task_clicked(self, task_id: str) -> None:
+        task = self.tasks.get(task_id)
+        if task is not None and task.status != TaskStatus.PENDING.value:
+            return
+
+        self.worker.cancel_queued_task(task_id)
+
         row = self._find_row_by_task_id(task_id)
         if row is not None:
             self.table.removeRow(row)
 
-        if task_id in self.tasks:
-            task = self.tasks[task_id]
-            if task.output_path and self.audio_player.current_file == task.output_path:
-                self.audio_player.stop()
-            del self.tasks[task_id]
+        self.tasks.pop(task_id, None)
         self.db.delete_task(task_id)
 
         # Re-index table numbers
@@ -2692,9 +2740,31 @@ class TextalkMainWindow(QMainWindow):
         self._update_queue_badge()
 
     def _clear_completed_tasks(self) -> None:
-        to_remove = [tid for tid, t in self.tasks.items() if t.status in ("Completed", "Failed")]
-        for tid in to_remove:
-            self._on_remove_task_clicked(tid)
+        to_remove = [
+            tid for tid, t in self.tasks.items()
+            if t.status in (TaskStatus.COMPLETED.value, TaskStatus.FAILED.value)
+        ]
+        if not to_remove:
+            return
+
+        for task_id in to_remove:
+            row = self._find_row_by_task_id(task_id)
+            if row is not None:
+                self.table.removeRow(row)
+
+            task = self.tasks.pop(task_id, None)
+            if task and task.output_path and self.audio_player.current_file == task.output_path:
+                self.audio_player.stop()
+
+        self.db.clear_completed_tasks()
+
+        # Re-index table numbers
+        for r in range(self.table.rowCount()):
+            idx_item = self.table.item(r, 0)
+            if idx_item:
+                idx_item.setText(str(r + 1))
+
+        self._update_queue_badge()
 
     def _on_table_row_double_clicked(self, row: int, col: int) -> None:
         # Playing audio directly upon double-clicking completed task row
