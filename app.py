@@ -1799,6 +1799,7 @@ class TaskDetailDialog(QDialog):
 
         title_lbl = QLabel(task.title or "Untitled Task", card)
         title_lbl.setObjectName("SectionHeading")
+        title_lbl.setTextFormat(Qt.PlainText)
         title_lbl.setWordWrap(True)
         header_hbox.addWidget(title_lbl, 1)
 
@@ -1836,6 +1837,14 @@ class TaskDetailDialog(QDialog):
             lbl = QLabel(text, details_container)
             lbl.setStyleSheet("color: #9ca3af; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;")
             return lbl
+
+        # Title
+        details_layout.addWidget(_add_field_label("Title"))
+        title_box = QLineEdit(task.title or "(None)", details_container)
+        title_box.setReadOnly(True)
+        if not task.title:
+            title_box.setStyleSheet("color: #6b7280;")
+        details_layout.addWidget(title_box)
 
         # Title Instruction
         details_layout.addWidget(_add_field_label("Title Instruction"))
