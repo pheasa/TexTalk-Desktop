@@ -1294,8 +1294,22 @@ class VoxCPMModelManager:
         import soundfile as sf
         import numpy as np
 
-        segments = self.split_text_segments(task.script_text)
-        total_segments = len(segments)
+        script_segments = self.split_text_segments(task.script_text)
+        synthesis_items: List[Tuple[str, str]] = []
+
+        # Synthesize title first when provided, using title_instruction (falling back to voice_instruction)
+        title_text = task.title.strip()
+        if title_text:
+            title_instr = task.title_instruction.strip() or task.voice_instruction.strip()
+            for title_seg in self.split_text_segments(title_text):
+                synthesis_items.append((title_seg, title_instr))
+
+        # Synthesize script segments using voice_instruction (falling back to title_instruction)
+        script_instr = task.voice_instruction.strip() or task.title_instruction.strip()
+        for seg in script_segments:
+            synthesis_items.append((seg, script_instr))
+
+        total_segments = len(synthesis_items)
         task.segments_total = total_segments
         task.segments_done = 0
 
@@ -1305,7 +1319,7 @@ class VoxCPMModelManager:
         silence_samples = int(self.sample_rate * 0.20)
         silence_pad = np.zeros(silence_samples, dtype=np.float32)
 
-        for idx, segment in enumerate(segments):
+        for idx, (segment, instr) in enumerate(synthesis_items):
             if should_cancel and should_cancel():
                 raise TaskCancelledError("Stopped by user.")
 
@@ -1314,12 +1328,8 @@ class VoxCPMModelManager:
                 pct = int((idx / total_segments) * 90)
                 progress_callback(task.task_id, pct, f"Generating segment {seg_num}/{total_segments}...")
 
-            # Prepend voice style instructions if provided
-            synth_text = segment
-            if task.voice_instruction.strip():
-                synth_text = f"({task.voice_instruction.strip()}) {segment}"
-            elif task.title_instruction.strip():
-                synth_text = f"({task.title_instruction.strip()}) {segment}"
+            # Prepend style instruction if provided
+            synth_text = f"({instr}) {segment}" if instr else segment
 
             # 1. VoxCPM2 Deep-Learning Inference
             wav = None
@@ -2676,9 +2686,9 @@ class TextalkMainWindow(QMainWindow):
             self.action_status_lbl.setStyleSheet("color: #f43f5e;")
             return
 
-        # Prepare task
+        # Prepare task (keep title empty when user leaves it blank so it isn't spoken twice)
         task_id = f"task_{int(time.time() * 1000)}"
-        title = self.title_input.text().strip() or script[:28]
+        title = self.title_input.text().strip()
         title_instr = self.title_instruction_input.text().strip()
         voice_instr = self.voice_instruction_input.toPlainText().strip()
 
@@ -2704,7 +2714,8 @@ class TextalkMainWindow(QMainWindow):
         self.title_input.clear()
         self.title_instruction_input.clear()
         self.script_input.clear()
-        self.action_status_lbl.setText(f"Task '{task.title[:20]}' added to queue.")
+        display_name = task.title or task.script_text[:20]
+        self.action_status_lbl.setText(f"Task '{display_name[:20]}' added to queue.")
         self.action_status_lbl.setStyleSheet("color: #10b981;")
 
     def _insert_table_row(self, task: SynthesisTask) -> None:
@@ -3004,12 +3015,13 @@ class TextalkMainWindow(QMainWindow):
                 self._set_row_remove_enabled(row, task_id, False)
             return
 
+        display_name = task.title or task.script_text[:28]
         if task.status == TaskStatus.PENDING.value:
             title = "Confirm Cancel Task"
-            prompt = f"Are you sure you want to cancel and remove '{task.title}' from the queue?"
+            prompt = f"Are you sure you want to cancel and remove '{display_name}' from the queue?"
         else:
             title = "Confirm Stop Processing"
-            prompt = f"Task '{task.title}' is currently processing.\nAre you sure you want to stop it and mark it as Failed?"
+            prompt = f"Task '{display_name}' is currently processing.\nAre you sure you want to stop it and mark it as Failed?"
 
         reply = QMessageBox.question(
             self,
@@ -3042,7 +3054,7 @@ class TextalkMainWindow(QMainWindow):
                 if idx_item:
                     idx_item.setText(str(r + 1))
 
-            self.action_status_lbl.setText(f"Cancelled queued task: {task.title[:30]}")
+            self.action_status_lbl.setText(f"Cancelled queued task: {display_name[:30]}")
             self.action_status_lbl.setStyleSheet("color: #9ca3af;")
             self._update_queue_badge()
 
@@ -3059,7 +3071,7 @@ class TextalkMainWindow(QMainWindow):
                     badge.set_status(TaskStatus.FAILED.value)
                 self._set_row_remove_enabled(row, task_id, False)
 
-            self.action_status_lbl.setText(f"Stopped task: {task.title[:30]}")
+            self.action_status_lbl.setText(f"Stopped task: {display_name[:30]}")
             self.action_status_lbl.setStyleSheet("color: #f43f5e;")
             self._update_queue_badge()
 
