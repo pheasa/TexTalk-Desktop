@@ -618,6 +618,11 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
 """
 
 
+class TaskCancelledError(Exception):
+    """Raised when an active synthesis task is stopped by the user."""
+    pass
+
+
 # ==============================================================================
 # 4. DATA MODELS & TASK DEFINITION
 # ==============================================================================
@@ -1281,7 +1286,7 @@ class VoxCPMModelManager:
         ) * envelope
         return wav.astype(np.float32)
 
-    def synthesize_task(self, task: SynthesisTask, progress_callback=None) -> str:
+    def synthesize_task(self, task: SynthesisTask, progress_callback=None, should_cancel=None) -> str:
         """
         Synthesizes the complete script in sequential segments and merges
         them into a final 24kHz WAV file saved to OUTPUT_DIR.
@@ -1301,6 +1306,9 @@ class VoxCPMModelManager:
         silence_pad = np.zeros(silence_samples, dtype=np.float32)
 
         for idx, segment in enumerate(segments):
+            if should_cancel and should_cancel():
+                raise TaskCancelledError("Stopped by user.")
+
             seg_num = idx + 1
             if progress_callback:
                 pct = int((idx / total_segments) * 90)
@@ -1346,6 +1354,9 @@ class VoxCPMModelManager:
             task.segments_done = seg_num
 
         # Concatenate all generated audio chunks
+        if should_cancel and should_cancel():
+            raise TaskCancelledError("Stopped by user.")
+
         full_audio = np.concatenate(audio_chunks, axis=0)
 
         # Ensure sample rate is exactly DEFAULT_SAMPLE_RATE (24kHz)
@@ -1531,9 +1542,13 @@ class QueueWorker(QThread):
         self.task_status_changed.emit(task.task_id, TaskStatus.PENDING.value, "Queued")
 
     def cancel_queued_task(self, task_id: str) -> None:
-        """Marks a queued task as cancelled so it is skipped before synthesis starts."""
+        """Marks a queued or active task as cancelled."""
         with self._cancel_lock:
             self._cancelled_task_ids.add(task_id)
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        with self._cancel_lock:
+            return task_id in self._cancelled_task_ids
 
     def stop(self) -> None:
         self._is_running = False
@@ -1570,14 +1585,21 @@ class QueueWorker(QThread):
             try:
                 # Ensure model weights are ready
                 def on_model_status(msg: str):
-                    self.task_status_changed.emit(task.task_id, TaskStatus.PROCESSING.value, msg)
+                    if not self.is_task_cancelled(task.task_id):
+                        self.task_status_changed.emit(task.task_id, TaskStatus.PROCESSING.value, msg)
 
                 self.model_manager.ensure_model_ready(status_callback=on_model_status)
+
+                if self.is_task_cancelled(task.task_id):
+                    raise TaskCancelledError("Stopped by user.")
 
                 # Synthesize segments
                 output_path = self.model_manager.synthesize_task(
                     task=task,
-                    progress_callback=lambda tid, pct, txt: self.progress_changed.emit(tid, pct, txt)
+                    progress_callback=lambda tid, pct, txt: (
+                        None if self.is_task_cancelled(tid) else self.progress_changed.emit(tid, pct, txt)
+                    ),
+                    should_cancel=lambda tid=task.task_id: self.is_task_cancelled(tid),
                 )
 
                 task.status = TaskStatus.COMPLETED.value
@@ -1594,6 +1616,8 @@ class QueueWorker(QThread):
                 self.task_status_changed.emit(task.task_id, TaskStatus.FAILED.value, err_msg)
                 self.task_failed.emit(task.task_id, err_msg)
             finally:
+                with self._cancel_lock:
+                    self._cancelled_task_ids.discard(task.task_id)
                 self.task_queue.task_done()
 
 
@@ -1732,6 +1756,239 @@ class GPUCheckDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         sys.exit(0)
+
+
+class TaskDetailDialog(QDialog):
+    """
+    Modern dark-themed popup dialog displaying full details of a SynthesisTask
+    when a user double-clicks a row in the task queue table.
+    """
+    def __init__(
+        self,
+        task: SynthesisTask,
+        audio_player: Optional[ModernAudioPlayer] = None,
+        on_play=None,
+        on_open_folder=None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.task = task
+        self.audio_player = audio_player
+        self._on_play = on_play
+        self._on_open_folder = on_open_folder
+
+        self.setWindowTitle(f"Task Details - {task.title or 'Untitled'}")
+        self.setMinimumSize(620, 520)
+        self.resize(680, 620)
+        self.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+        self.setStyleSheet(DARK_THEME_QSS)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(20, 20, 20, 20)
+        main_layout.setSpacing(14)
+
+        card = QFrame(self)
+        card.setObjectName("CardFrame")
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(22, 20, 22, 20)
+        card_layout.setSpacing(14)
+
+        # Header: Title + Status Badge
+        header_hbox = QHBoxLayout()
+        header_hbox.setSpacing(12)
+
+        title_lbl = QLabel(task.title or "Untitled Task", card)
+        title_lbl.setObjectName("SectionHeading")
+        title_lbl.setWordWrap(True)
+        header_hbox.addWidget(title_lbl, 1)
+
+        status_badge = StatusBadge(task.status, card)
+        header_hbox.addWidget(status_badge, 0, Qt.AlignTop)
+        card_layout.addLayout(header_hbox)
+
+        # Metadata summary row
+        meta_parts = [
+            f"ID: {task.task_id}",
+            f"Created: {task.created_at}",
+            f"Progress: {task.progress}%",
+        ]
+        if task.segments_total > 0:
+            meta_parts.append(f"Segments: {task.segments_done}/{task.segments_total}")
+        meta_lbl = QLabel("  •  ".join(meta_parts), card)
+        meta_lbl.setObjectName("SecondaryText")
+        meta_lbl.setWordWrap(True)
+        meta_lbl.setStyleSheet("color: #9ca3af; font-size: 12px;")
+        card_layout.addWidget(meta_lbl)
+
+        # Scrollable details area
+        scroll = QScrollArea(card)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setStyleSheet("QScrollArea { background-color: transparent; border: none; }")
+
+        details_container = QWidget()
+        details_container.setStyleSheet("background-color: transparent;")
+        details_layout = QVBoxLayout(details_container)
+        details_layout.setContentsMargins(0, 4, 4, 4)
+        details_layout.setSpacing(12)
+
+        def _add_field_label(text: str) -> QLabel:
+            lbl = QLabel(text, details_container)
+            lbl.setStyleSheet("color: #9ca3af; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px;")
+            return lbl
+
+        # Title Instruction
+        details_layout.addWidget(_add_field_label("Title Instruction"))
+        title_instr_box = QLineEdit(task.title_instruction or "(None)", details_container)
+        title_instr_box.setReadOnly(True)
+        if not task.title_instruction:
+            title_instr_box.setStyleSheet("color: #6b7280;")
+        details_layout.addWidget(title_instr_box)
+
+        # Voice Instruction
+        details_layout.addWidget(_add_field_label("Voice Instruction"))
+        voice_instr_box = QTextEdit(details_container)
+        voice_instr_box.setReadOnly(True)
+        voice_instr_box.setPlainText(task.voice_instruction or "(None)")
+        voice_instr_box.setFixedHeight(68)
+        if not task.voice_instruction:
+            voice_instr_box.setStyleSheet("color: #6b7280;")
+        details_layout.addWidget(voice_instr_box)
+
+        # Reference Audio
+        details_layout.addWidget(_add_field_label("Reference Audio"))
+        ref_text = task.reference_audio if task.reference_audio else "(None)"
+        ref_box = QLineEdit(ref_text, details_container)
+        ref_box.setReadOnly(True)
+        if task.reference_audio:
+            ref_box.setToolTip(task.reference_audio)
+        else:
+            ref_box.setStyleSheet("color: #6b7280;")
+        details_layout.addWidget(ref_box)
+
+        # Script Text
+        script_header = QHBoxLayout()
+        script_header.addWidget(_add_field_label("Script Text"))
+        script_header.addStretch()
+        char_lbl = QLabel(f"{len(task.script_text)} chars", details_container)
+        char_lbl.setStyleSheet("color: #6b7280; font-size: 11px;")
+        script_header.addWidget(char_lbl)
+        details_layout.addLayout(script_header)
+
+        script_box = QTextEdit(details_container)
+        script_box.setReadOnly(True)
+        script_box.setPlainText(task.script_text)
+        script_box.setMinimumHeight(140)
+        details_layout.addWidget(script_box)
+
+        # Output Path (if available)
+        if task.output_path or task.output_folder:
+            details_layout.addWidget(_add_field_label("Output File"))
+            out_box = QLineEdit(task.output_path or task.output_folder or "", details_container)
+            out_box.setReadOnly(True)
+            out_box.setToolTip(out_box.text())
+            details_layout.addWidget(out_box)
+
+        # Error Message (if failed / present)
+        if task.error_message:
+            details_layout.addWidget(_add_field_label("Error Details"))
+            err_box = QTextEdit(details_container)
+            err_box.setReadOnly(True)
+            err_box.setPlainText(task.error_message)
+            err_box.setFixedHeight(80)
+            err_box.setStyleSheet(
+                "background-color: #1f1218; border: 1px solid #881337; "
+                "border-radius: 8px; color: #fda4af; padding: 8px;"
+            )
+            details_layout.addWidget(err_box)
+
+        details_layout.addStretch()
+        scroll.setWidget(details_container)
+        card_layout.addWidget(scroll, 1)
+
+        # Footer Action Buttons
+        footer_hbox = QHBoxLayout()
+        footer_hbox.setSpacing(10)
+
+        is_completed = task.status == TaskStatus.COMPLETED.value
+
+        self.play_btn = QPushButton("▶ Play Audio", card)
+        self.play_btn.setProperty("class", "TablePlayBtn")
+        self.play_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.play_btn.setMinimumHeight(36)
+        self.play_btn.setEnabled(bool(is_completed and task.output_path))
+        self.play_btn.clicked.connect(self._handle_play_clicked)
+        footer_hbox.addWidget(self.play_btn)
+
+        self.folder_btn = QPushButton("📁 Open Folder", card)
+        self.folder_btn.setProperty("class", "TableActionBtn")
+        self.folder_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.folder_btn.setMinimumHeight(36)
+        self.folder_btn.setEnabled(bool(is_completed and (task.output_path or task.output_folder)))
+        self.folder_btn.clicked.connect(self._handle_folder_clicked)
+        footer_hbox.addWidget(self.folder_btn)
+
+        self.copy_btn = QPushButton("📋 Copy Script", card)
+        self.copy_btn.setProperty("class", "TableActionBtn")
+        self.copy_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        self.copy_btn.setMinimumHeight(36)
+        self.copy_btn.clicked.connect(self._handle_copy_script)
+        footer_hbox.addWidget(self.copy_btn)
+
+        footer_hbox.addStretch()
+
+        close_btn = QPushButton("Close", card)
+        close_btn.setObjectName("PrimaryButton")
+        close_btn.setCursor(QCursor(Qt.PointingHandCursor))
+        close_btn.setMinimumHeight(36)
+        close_btn.clicked.connect(self.accept)
+        footer_hbox.addWidget(close_btn)
+
+        card_layout.addLayout(footer_hbox)
+        main_layout.addWidget(card)
+
+        # Sync play button state if audio player is active
+        if self.audio_player is not None:
+            self._sync_play_button(self.audio_player.current_file, self.audio_player.is_playing)
+            self.audio_player.state_changed.connect(self._sync_play_button)
+            self.finished.connect(self._disconnect_audio_signal)
+
+    def _disconnect_audio_signal(self) -> None:
+        if self.audio_player is not None:
+            try:
+                self.audio_player.state_changed.disconnect(self._sync_play_button)
+            except (RuntimeError, TypeError):
+                pass
+
+    @Slot(str, bool)
+    def _sync_play_button(self, file_path: str, is_playing: bool) -> None:
+        if not self.task.output_path:
+            return
+        norm_target = os.path.normpath(os.path.abspath(file_path)) if file_path else ""
+        norm_out = os.path.normpath(os.path.abspath(self.task.output_path))
+        if norm_target == norm_out and is_playing:
+            self.play_btn.setText("⏹ Stop Audio")
+            self.play_btn.setProperty("class", "TableStopBtn")
+        else:
+            self.play_btn.setText("▶ Play Audio")
+            self.play_btn.setProperty("class", "TablePlayBtn")
+        self.play_btn.style().unpolish(self.play_btn)
+        self.play_btn.style().polish(self.play_btn)
+
+    def _handle_play_clicked(self) -> None:
+        if self._on_play:
+            self._on_play()
+
+    def _handle_folder_clicked(self) -> None:
+        if self._on_open_folder:
+            self._on_open_folder()
+
+    def _handle_copy_script(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard:
+            clipboard.setText(self.task.script_text)
+        self.copy_btn.setText("✓ Copied")
+        QTimer.singleShot(1500, lambda: self.copy_btn.setText("📋 Copy Script"))
 
 
 # ==============================================================================
@@ -2525,25 +2782,33 @@ class TextalkMainWindow(QMainWindow):
         folder_btn.clicked.connect(lambda checked=False, tid=task_id: self._on_open_task_folder_clicked(tid))
         layout.addWidget(folder_btn)
 
-        # Remove Button (only enabled while task is queued / Pending)
+        # Remove / Cancel Button (visible & enabled for Pending and Processing; hidden for Completed / Failed)
         remove_btn = QPushButton("✕", container)
         remove_btn.setObjectName(f"remove_{task_id}")
         remove_btn.setProperty("class", "TableRemoveBtn")
         remove_btn.setCursor(QCursor(Qt.PointingHandCursor))
-        remove_btn.setToolTip("Delete task from queue")
         task = self.tasks.get(task_id)
-        remove_btn.setEnabled(task is None or task.status == TaskStatus.PENDING.value)
+        status = task.status if task else TaskStatus.PENDING.value
+        is_active = status in (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value)
+        remove_btn.setToolTip(
+            "Stop processing task" if status == TaskStatus.PROCESSING.value else "Cancel task from queue"
+        )
+        remove_btn.setVisible(is_active)
+        remove_btn.setEnabled(is_active)
         remove_btn.clicked.connect(lambda checked=False, tid=task_id: self._on_remove_task_clicked(tid))
         layout.addWidget(remove_btn)
 
         return container
 
-    def _set_row_remove_enabled(self, row: int, task_id: str, enabled: bool) -> None:
+    def _set_row_remove_enabled(self, row: int, task_id: str, enabled: bool, tooltip: Optional[str] = None) -> None:
         action_widget = self.table.cellWidget(row, 5)
         if action_widget:
             remove_btn = action_widget.findChild(QPushButton, f"remove_{task_id}")
             if remove_btn:
+                remove_btn.setVisible(enabled)
                 remove_btn.setEnabled(enabled)
+                if tooltip is not None:
+                    remove_btn.setToolTip(tooltip)
 
     def _find_row_by_task_id(self, task_id: str) -> Optional[int]:
         # Identify row by task_id in actions widget
@@ -2590,7 +2855,9 @@ class TextalkMainWindow(QMainWindow):
             badge = self.table.cellWidget(row, 2)
             if isinstance(badge, StatusBadge):
                 badge.set_status(status)
-            self._set_row_remove_enabled(row, task_id, status == TaskStatus.PENDING.value)
+            is_active = status in (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value)
+            tooltip = "Stop processing task" if status == TaskStatus.PROCESSING.value else "Cancel task from queue"
+            self._set_row_remove_enabled(row, task_id, is_active, tooltip)
 
         self.action_status_lbl.setText(f"Status: {message}")
         self.action_status_lbl.setStyleSheet("color: #e2e8f0;")
@@ -2719,25 +2986,73 @@ class TextalkMainWindow(QMainWindow):
 
     def _on_remove_task_clicked(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
-        if task is not None and task.status != TaskStatus.PENDING.value:
+        if not task:
             return
 
-        self.worker.cancel_queued_task(task_id)
+        if task.status not in (TaskStatus.PENDING.value, TaskStatus.PROCESSING.value):
+            row = self._find_row_by_task_id(task_id)
+            if row is not None:
+                self._set_row_remove_enabled(row, task_id, False)
+            return
 
-        row = self._find_row_by_task_id(task_id)
-        if row is not None:
-            self.table.removeRow(row)
+        if task.status == TaskStatus.PENDING.value:
+            title = "Confirm Cancel Task"
+            prompt = f"Are you sure you want to cancel and remove '{task.title}' from the queue?"
+        else:
+            title = "Confirm Stop Processing"
+            prompt = f"Task '{task.title}' is currently processing.\nAre you sure you want to stop it and mark it as Failed?"
 
-        self.tasks.pop(task_id, None)
-        self.db.delete_task(task_id)
+        reply = QMessageBox.question(
+            self,
+            title,
+            prompt,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
 
-        # Re-index table numbers
-        for r in range(self.table.rowCount()):
-            idx_item = self.table.item(r, 0)
-            if idx_item:
-                idx_item.setText(str(r + 1))
+        # Re-read task after confirmation dialog in case status changed while prompt was open
+        task = self.tasks.get(task_id)
+        if not task:
+            return
 
-        self._update_queue_badge()
+        if task.status == TaskStatus.PENDING.value:
+            self.worker.cancel_queued_task(task_id)
+
+            row = self._find_row_by_task_id(task_id)
+            if row is not None:
+                self.table.removeRow(row)
+
+            self.tasks.pop(task_id, None)
+            self.db.delete_task(task_id)
+
+            # Re-index table numbers
+            for r in range(self.table.rowCount()):
+                idx_item = self.table.item(r, 0)
+                if idx_item:
+                    idx_item.setText(str(r + 1))
+
+            self.action_status_lbl.setText(f"Cancelled queued task: {task.title[:30]}")
+            self.action_status_lbl.setStyleSheet("color: #9ca3af;")
+            self._update_queue_badge()
+
+        elif task.status == TaskStatus.PROCESSING.value:
+            self.worker.cancel_queued_task(task_id)
+            task.status = TaskStatus.FAILED.value
+            task.error_message = "Stopped by user."
+            self.db.upsert_task(task)
+
+            row = self._find_row_by_task_id(task_id)
+            if row is not None:
+                badge = self.table.cellWidget(row, 2)
+                if isinstance(badge, StatusBadge):
+                    badge.set_status(TaskStatus.FAILED.value)
+                self._set_row_remove_enabled(row, task_id, False)
+
+            self.action_status_lbl.setText(f"Stopped task: {task.title[:30]}")
+            self.action_status_lbl.setStyleSheet("color: #f43f5e;")
+            self._update_queue_badge()
 
     def _clear_completed_tasks(self) -> None:
         to_remove = [
@@ -2767,12 +3082,25 @@ class TextalkMainWindow(QMainWindow):
         self._update_queue_badge()
 
     def _on_table_row_double_clicked(self, row: int, col: int) -> None:
-        # Playing audio directly upon double-clicking completed task row
+        # Open task detail popup dialog upon double-clicking a task row
         widget = self.table.cellWidget(row, 5)
-        if widget:
-            tid = widget.property("task_id")
-            if tid:
-                self._on_play_task_clicked(tid)
+        if not widget:
+            return
+        tid = widget.property("task_id")
+        if not tid:
+            return
+        task = self.tasks.get(tid)
+        if not task:
+            return
+
+        dialog = TaskDetailDialog(
+            task=task,
+            audio_player=self.audio_player,
+            on_play=lambda task_id=tid: self._on_play_task_clicked(task_id),
+            on_open_folder=lambda task_id=tid: self._on_open_task_folder_clicked(task_id),
+            parent=self,
+        )
+        dialog.exec()
 
     @Slot(str, bool)
     def _on_audio_state_changed(self, file_path: str, is_playing: bool) -> None:
