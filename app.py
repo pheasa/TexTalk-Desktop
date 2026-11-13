@@ -23,10 +23,14 @@ import re
 import io
 import time
 import math
+import uuid
+import base64
 import queue
 import shutil
+import sqlite3
 import platform
 import tempfile
+import threading
 import subprocess
 import urllib.request
 import urllib.parse
@@ -37,15 +41,51 @@ from typing import Optional, List, Dict, Any, Tuple
 
 import numpy as np
 import soundfile as sf
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 # ==============================================================================
 # 1. TOP-LEVEL CONFIGURATION & CONSTANTS
 # ==============================================================================
-REQUIRE_GPU: bool = True              # Set to True to enforce NVIDIA CUDA GPU check on startup
+REQUIRE_GPU: bool = False              # Set to True to enforce NVIDIA CUDA GPU check on startup
 MODEL_ID: str = "openbmb/VoxCPM2"      # HuggingFace repository ID
 DEFAULT_SAMPLE_RATE: int = 24000        # Standard output sample rate (24kHz)
 DEFAULT_MODEL_DIR: str = "./models/VoxCPM2"  # Local offline weights directory
 MAX_SCRIPT_CHARS: int = 5000           # Script character counter limit
+DEFAULT_DB_PATH: str = os.path.abspath("./textalk.db")
+APP_SECRET_SALT: bytes = b"Textalk-VoxCPM2-LocalDB-Secret-Salt-2026"
+PBKDF2_ITERATIONS: int = 200_000
+
+_FERNET_INSTANCE: Optional[Fernet] = None
+
+
+def init_fernet_key() -> Fernet:
+    """Derives and caches the Fernet key once using PBKDF2-HMAC-SHA256 and the PC MAC address."""
+    global _FERNET_INSTANCE
+    if _FERNET_INSTANCE is None:
+        password = str(uuid.getnode()).encode("utf-8")
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=APP_SECRET_SALT,
+            iterations=PBKDF2_ITERATIONS,
+        )
+        key = base64.urlsafe_b64encode(kdf.derive(password))
+        _FERNET_INSTANCE = Fernet(key)
+    return _FERNET_INSTANCE
+
+
+def encrypt_data(data: bytes | str) -> bytes:
+    """Encrypts bytes or UTF-8 string using the cached Fernet key."""
+    raw = data.encode("utf-8") if isinstance(data, str) else data
+    return init_fernet_key().encrypt(raw)
+
+
+def decrypt_data(token: bytes | str) -> bytes:
+    """Decrypts a Fernet token using the cached Fernet key."""
+    raw_token = token.encode("utf-8") if isinstance(token, str) else token
+    return init_fernet_key().decrypt(raw_token)
 
 def configure_textalk_output_dir(base_dir: str) -> str:
     """
@@ -587,9 +627,357 @@ class SynthesisTask:
     progress: int = 0         # 0 to 100
     created_at: str = field(default_factory=lambda: datetime.now().strftime("%H:%M:%S"))
     output_path: Optional[str] = None
+    output_folder: Optional[str] = None
     error_message: Optional[str] = None
     segments_total: int = 0
     segments_done: int = 0
+
+
+# ==============================================================================
+# 4B. ENCRYPTED LOCAL SQLITE DATABASE MANAGER
+# ==============================================================================
+class LocalDatabaseManager:
+    """
+    Manages a local SQLite database file encrypted at rest using Fernet.
+    - Creates and migrates the encrypted database if missing on startup.
+    - Detects unencrypted legacy SQLite files, backs them up, and encrypts them.
+    - Verifies tables and columns on startup and remigrates if schema mismatches.
+    - Encrypts before every write and decrypts right after reading.
+    """
+    SQLITE_HEADER: bytes = b"SQLite format 3\x00"
+    EXPECTED_SCHEMA: Dict[str, List[str]] = {
+        "tasks": [
+            "task_id",
+            "title",
+            "title_instruction",
+            "script_text",
+            "voice_instruction",
+            "reference_audio",
+            "status",
+            "progress",
+            "created_at",
+            "output_path",
+            "output_folder",
+            "error_message",
+            "segments_total",
+            "segments_done",
+        ],
+        "app_settings": ["key", "value"],
+    }
+
+    def __init__(self, db_path: str = DEFAULT_DB_PATH):
+        self.db_path = os.path.abspath(db_path)
+        self._lock = threading.RLock()
+        self._conn: Optional[sqlite3.Connection] = None
+        self._read_only_fallback: bool = False
+        self.startup_warning: Optional[str] = None
+
+    def initialize(self) -> Tuple[bool, Optional[str]]:
+        """Initializes, decrypts, and validates/migrates the local database file."""
+        with self._lock:
+            self._read_only_fallback = False
+            self.startup_warning = None
+
+            if not os.path.exists(self.db_path):
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._create_schema(self._conn)
+                self._save_encrypted()
+                print(f"[Database] Migrated new encrypted database at: {self.db_path}")
+                return True, None
+
+            try:
+                with open(self.db_path, "rb") as f:
+                    raw_bytes = f.read()
+            except Exception as read_err:
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._create_schema(self._conn)
+                self._read_only_fallback = True
+                msg = f"Could not read local database file '{self.db_path}': {read_err}"
+                self.startup_warning = msg
+                return False, msg
+
+            if raw_bytes.startswith(self.SQLITE_HEADER):
+                # Legacy unencrypted SQLite file detected: back up first, then encrypt in place
+                backup_path = f"{self.db_path}.bak"
+                try:
+                    shutil.copy2(self.db_path, backup_path)
+                    self._write_atomic(encrypt_data(raw_bytes))
+                    print(f"[Database] Unencrypted database detected. Backed up to {backup_path} and encrypted.")
+                except Exception as enc_err:
+                    print(f"[Database] Failed to migrate unencrypted database: {enc_err}")
+                plain_bytes = raw_bytes
+            else:
+                try:
+                    plain_bytes = decrypt_data(raw_bytes)
+                except (InvalidToken, Exception) as dec_err:
+                    self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                    self._create_schema(self._conn)
+                    self._read_only_fallback = True
+                    msg = (
+                        f"Could not decrypt local database '{os.path.basename(self.db_path)}'.\n"
+                        "The file may have been created on a different PC or is damaged.\n"
+                        "Running with a temporary in-memory session (existing file was not modified)."
+                    )
+                    self.startup_warning = msg
+                    print(f"[Database] Decryption failed: {dec_err}")
+                    return False, msg
+
+            try:
+                conn = sqlite3.connect(":memory:", check_same_thread=False)
+                conn.deserialize(plain_bytes)
+                self._conn = conn
+            except Exception as db_err:
+                self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._create_schema(self._conn)
+                self._read_only_fallback = True
+                msg = (
+                    f"Local database '{os.path.basename(self.db_path)}' is corrupted or unreadable ({db_err}).\n"
+                    "Running with a temporary in-memory session."
+                )
+                self.startup_warning = msg
+                return False, msg
+
+            if not self._schema_matches(self._conn):
+                print("[Database] Schema mismatch detected. Remigrating database...")
+                self._remigrate(self._conn)
+                self._save_encrypted()
+
+            return True, None
+
+    def _create_schema(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                task_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                title_instruction TEXT NOT NULL,
+                script_text TEXT NOT NULL,
+                voice_instruction TEXT NOT NULL,
+                reference_audio TEXT,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                output_path TEXT,
+                output_folder TEXT,
+                error_message TEXT,
+                segments_total INTEGER NOT NULL DEFAULT 0,
+                segments_done INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+    def _schema_matches(self, conn: sqlite3.Connection) -> bool:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        for table, expected_cols in self.EXPECTED_SCHEMA.items():
+            if table not in existing_tables:
+                return False
+            actual_cols = [
+                row[1] for row in conn.execute(f'PRAGMA table_info("{table}")').fetchall()
+            ]
+            if actual_cols != expected_cols:
+                return False
+        return True
+
+    def _remigrate(self, conn: sqlite3.Connection) -> None:
+        existing_tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+
+        preserved_tasks: List[Dict[str, Any]] = []
+        if "tasks" in existing_tables:
+            cols = [row[1] for row in conn.execute('PRAGMA table_info("tasks")').fetchall()]
+            common_cols = [c for c in self.EXPECTED_SCHEMA["tasks"] if c in cols]
+            if "task_id" in common_cols:
+                col_sql = ", ".join(f'"{c}"' for c in common_cols)
+                for row in conn.execute(f"SELECT {col_sql} FROM tasks").fetchall():
+                    preserved_tasks.append(dict(zip(common_cols, row)))
+
+        preserved_settings: List[Tuple[str, str]] = []
+        if "app_settings" in existing_tables:
+            cols = [row[1] for row in conn.execute('PRAGMA table_info("app_settings")').fetchall()]
+            if "key" in cols and "value" in cols:
+                preserved_settings = conn.execute("SELECT key, value FROM app_settings").fetchall()
+
+        for table in self.EXPECTED_SCHEMA:
+            conn.execute(f'DROP TABLE IF EXISTS "{table}"')
+        self._create_schema(conn)
+
+        for item in preserved_tasks:
+            out_path = item.get("output_path")
+            out_folder = item.get("output_folder") or (os.path.dirname(out_path) if out_path else None)
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO tasks (
+                    task_id, title, title_instruction, script_text, voice_instruction,
+                    reference_audio, status, progress, created_at, output_path,
+                    output_folder, error_message, segments_total, segments_done
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item.get("task_id"),
+                    item.get("title") or "",
+                    item.get("title_instruction") or "",
+                    item.get("script_text") or "",
+                    item.get("voice_instruction") or "",
+                    item.get("reference_audio"),
+                    item.get("status") or "Failed",
+                    int(item.get("progress") or 0),
+                    item.get("created_at") or "",
+                    out_path,
+                    out_folder,
+                    item.get("error_message"),
+                    int(item.get("segments_total") or 0),
+                    int(item.get("segments_done") or 0),
+                ),
+            )
+
+        for k, v in preserved_settings:
+            conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+                (k, v),
+            )
+        conn.commit()
+
+    def _write_atomic(self, payload: bytes) -> None:
+        db_dir = os.path.dirname(self.db_path) or "."
+        os.makedirs(db_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".textalk_db_", suffix=".tmp", dir=db_dir)
+        try:
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload)
+            os.replace(tmp_path, self.db_path)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+
+    def _save_encrypted(self) -> None:
+        if self._read_only_fallback or self._conn is None:
+            return
+        plain_bytes = self._conn.serialize()
+        encrypted_bytes = encrypt_data(plain_bytes)
+        self._write_atomic(encrypted_bytes)
+
+    def upsert_task(self, task: SynthesisTask) -> None:
+        with self._lock:
+            if self._conn is None:
+                return
+            out_folder = task.output_folder or (os.path.dirname(task.output_path) if task.output_path else None)
+            self._conn.execute(
+                """
+                INSERT OR REPLACE INTO tasks (
+                    task_id, title, title_instruction, script_text, voice_instruction,
+                    reference_audio, status, progress, created_at, output_path,
+                    output_folder, error_message, segments_total, segments_done
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task.task_id,
+                    task.title,
+                    task.title_instruction,
+                    task.script_text,
+                    task.voice_instruction,
+                    task.reference_audio,
+                    task.status,
+                    task.progress,
+                    task.created_at,
+                    task.output_path,
+                    out_folder,
+                    task.error_message,
+                    task.segments_total,
+                    task.segments_done,
+                ),
+            )
+            self._conn.commit()
+            self._save_encrypted()
+
+    def delete_task(self, task_id: str) -> None:
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.execute("DELETE FROM tasks WHERE task_id = ?", (task_id,))
+            self._conn.commit()
+            self._save_encrypted()
+
+    def clear_completed_tasks(self) -> None:
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.execute("DELETE FROM tasks WHERE status IN ('Completed', 'Failed')")
+            self._conn.commit()
+            self._save_encrypted()
+
+    def load_all_tasks(self) -> List[SynthesisTask]:
+        with self._lock:
+            if self._conn is None:
+                return []
+            rows = self._conn.execute(
+                """
+                SELECT task_id, title, title_instruction, script_text, voice_instruction,
+                       reference_audio, status, progress, created_at, output_path,
+                       output_folder, error_message, segments_total, segments_done
+                FROM tasks
+                """
+            ).fetchall()
+            tasks: List[SynthesisTask] = []
+            for r in rows:
+                tasks.append(
+                    SynthesisTask(
+                        task_id=r[0],
+                        title=r[1],
+                        title_instruction=r[2],
+                        script_text=r[3],
+                        voice_instruction=r[4],
+                        reference_audio=r[5],
+                        status=r[6],
+                        progress=r[7],
+                        created_at=r[8],
+                        output_path=r[9],
+                        output_folder=r[10],
+                        error_message=r[11],
+                        segments_total=r[12],
+                        segments_done=r[13],
+                    )
+                )
+            return tasks
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._lock:
+            if self._conn is None:
+                return None
+            row = self._conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+            return row[0] if row else None
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock:
+            if self._conn is None:
+                return
+            self._conn.execute(
+                "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+                (key, value),
+            )
+            self._conn.commit()
+            self._save_encrypted()
 
 
 # ==============================================================================
@@ -1007,7 +1395,7 @@ from PySide6.QtWidgets import (
     QGridLayout, QLabel, QLineEdit, QTextEdit, QPushButton,
     QProgressBar, QTableWidget, QTableWidgetItem, QHeaderView,
     QFileDialog, QDialog, QScrollArea, QFrame, QSizePolicy,
-    QAbstractItemView, QSplitter, QStackedWidget
+    QAbstractItemView, QSplitter, QStackedWidget, QMessageBox
 )
 
 try:
@@ -1333,11 +1721,27 @@ class TextalkMainWindow(QMainWindow):
     """
     ASPECT_RATIO: float = 1.0 / 0.8  # 1.25 (Width : Height = 1.0 : 0.8)
 
-    def __init__(self, gpu_status_text: str, is_cuda_active: bool):
+    def __init__(
+        self,
+        gpu_status_text: str,
+        is_cuda_active: bool,
+        db: Optional[LocalDatabaseManager] = None,
+    ):
         super().__init__()
+        global OUTPUT_DIR
         self.gpu_status_text = gpu_status_text
         self.is_cuda_active = is_cuda_active
         self._is_resizing: bool = False
+
+        if db is None:
+            self.db = LocalDatabaseManager()
+            self.db.initialize()
+        else:
+            self.db = db
+
+        saved_output_dir = self.db.get_setting("output_dir")
+        if saved_output_dir and os.path.isdir(saved_output_dir):
+            OUTPUT_DIR = os.path.abspath(saved_output_dir)
 
         self.setWindowTitle("Textalk - VoxCPM2 Desktop")
         # Proportional 1 : 0.8 Aspect Ratio (Minimum 950x760, Initial 1000x800)
@@ -1361,6 +1765,35 @@ class TextalkMainWindow(QMainWindow):
         self.selected_ref_audio: Optional[str] = None
 
         self._build_ui()
+        self._load_persisted_tasks()
+
+        if self.db.startup_warning:
+            QTimer.singleShot(0, self._show_db_startup_warning)
+
+    def _show_db_startup_warning(self) -> None:
+        if self.db.startup_warning:
+            QMessageBox.warning(self, "Database Warning", self.db.startup_warning)
+
+    def _load_persisted_tasks(self) -> None:
+        for task in self.db.load_all_tasks():
+            if task.status in ("Pending", "Processing"):
+                task.status = "Failed"
+                task.error_message = task.error_message or "Interrupted before completion."
+                self.db.upsert_task(task)
+            self.tasks[task.task_id] = task
+            self._insert_table_row(task)
+            if task.status == "Completed":
+                row = self._find_row_by_task_id(task.task_id)
+                if row is not None:
+                    action_widget = self.table.cellWidget(row, 5)
+                    if action_widget:
+                        play_btn = action_widget.findChild(QPushButton, f"play_{task.task_id}")
+                        if play_btn:
+                            play_btn.setEnabled(True)
+                        folder_btn = action_widget.findChild(QPushButton, f"folder_{task.task_id}")
+                        if folder_btn:
+                            folder_btn.setEnabled(True)
+        self._update_queue_badge()
 
     def resizeEvent(self, event) -> None:
         """Enforces a smooth 1 : 0.8 aspect ratio during window resizing."""
@@ -1650,6 +2083,7 @@ class TextalkMainWindow(QMainWindow):
         )
         if chosen_dir:
             OUTPUT_DIR = configure_textalk_output_dir(chosen_dir)
+            self.db.set_setting("output_dir", OUTPUT_DIR)
             if hasattr(self, "model_text_lbl"):
                 self.model_text_lbl.setText(
                     f"● Model Repository: {MODEL_ID}\n"
@@ -1957,10 +2391,12 @@ class TextalkMainWindow(QMainWindow):
             title_instruction=title_instr,
             script_text=script,
             voice_instruction=voice_instr,
-            reference_audio=self.selected_ref_audio
+            reference_audio=self.selected_ref_audio,
+            output_folder=OUTPUT_DIR,
         )
 
         self.tasks[task_id] = task
+        self.db.upsert_task(task)
         self.worker.add_task(task)
 
         # Insert row into table
@@ -2104,6 +2540,7 @@ class TextalkMainWindow(QMainWindow):
     def _on_task_status_changed(self, task_id: str, status: str, message: str) -> None:
         if task_id in self.tasks:
             self.tasks[task_id].status = status
+            self.db.upsert_task(self.tasks[task_id])
 
         row = self._find_row_by_task_id(task_id)
         if row is not None:
@@ -2137,6 +2574,8 @@ class TextalkMainWindow(QMainWindow):
             task.status = "Completed"
             task.progress = 100
             task.output_path = output_path
+            task.output_folder = os.path.dirname(output_path)
+            self.db.upsert_task(task)
 
         row = self._find_row_by_task_id(task_id)
         if row is not None:
@@ -2176,6 +2615,7 @@ class TextalkMainWindow(QMainWindow):
             task = self.tasks[task_id]
             task.status = "Failed"
             task.error_message = err_msg
+            self.db.upsert_task(task)
 
         row = self._find_row_by_task_id(task_id)
         if row is not None:
@@ -2202,21 +2642,34 @@ class TextalkMainWindow(QMainWindow):
         if task.output_path and os.path.exists(task.output_path):
             self.audio_player.play_toggle(task.output_path)
         else:
+            missing_path = task.output_path or "Unknown path"
             self.action_status_lbl.setText("Audio file does not exist or has been moved.")
             self.action_status_lbl.setStyleSheet("color: #f43f5e;")
+            QMessageBox.warning(
+                self,
+                "Audio File Not Found",
+                f"The audio file could not be found. It may have been moved or deleted:\n\n{missing_path}",
+            )
 
     def _on_open_task_folder_clicked(self, task_id: str) -> None:
         task = self.tasks.get(task_id)
-        if task and task.output_path and os.path.exists(task.output_path):
+        if not task:
+            return
+        folder = task.output_folder or (os.path.dirname(task.output_path) if task.output_path else "")
+        if not folder or not os.path.isdir(folder):
+            self.action_status_lbl.setText("Output folder has been deleted or does not exist.")
+            self.action_status_lbl.setStyleSheet("color: #f43f5e;")
+            QMessageBox.warning(
+                self,
+                "Output Folder Not Found",
+                f"The output folder for this task has been deleted or does not exist:\n\n{folder or 'Unknown folder'}",
+            )
+            return
+
+        if task.output_path and os.path.exists(task.output_path):
             open_folder_and_select_file(task.output_path)
-        elif task and task.output_path:
-            folder = os.path.dirname(task.output_path)
-            if os.path.exists(folder):
-                open_folder_and_select_file(folder)
-            else:
-                open_folder_and_select_file(OUTPUT_DIR)
         else:
-            open_folder_and_select_file(OUTPUT_DIR)
+            open_folder_and_select_file(folder)
 
     def _on_remove_task_clicked(self, task_id: str) -> None:
         row = self._find_row_by_task_id(task_id)
@@ -2228,6 +2681,7 @@ class TextalkMainWindow(QMainWindow):
             if task.output_path and self.audio_player.current_file == task.output_path:
                 self.audio_player.stop()
             del self.tasks[task_id]
+        self.db.delete_task(task_id)
 
         # Re-index table numbers
         for r in range(self.table.rowCount()):
@@ -2289,6 +2743,13 @@ class TextalkMainWindow(QMainWindow):
 # 10. MAIN ENTRY POINT & GPU GUARD
 # ==============================================================================
 def main() -> None:
+    # Derive and cache Fernet encryption key once at startup
+    init_fernet_key()
+
+    # Initialize / migrate / verify encrypted local database
+    db = LocalDatabaseManager()
+    db.initialize()
+
     # High-DPI support is enabled by default in Qt 6
     app = QApplication(sys.argv)
     app.setApplicationName("Textalk - VoxCPM2")
@@ -2305,7 +2766,7 @@ def main() -> None:
         sys.exit(0)
 
     # 2. Launch Main Window
-    window = TextalkMainWindow(gpu_status_text=status_str, is_cuda_active=has_cuda)
+    window = TextalkMainWindow(gpu_status_text=status_str, is_cuda_active=has_cuda, db=db)
     window.show()
 
     sys.exit(app.exec())
@@ -2336,7 +2797,7 @@ Step 2: Install PyInstaller & Bundling Dependencies
 ---------------------------------------------------
 In your Python 3.10+ virtual environment:
 
-    pip install pyinstaller voxcpm soundfile torch torchaudio huggingface_hub
+    pip install pyinstaller voxcpm soundfile torch torchaudio huggingface_hub cryptography
 
 Step 3: PyInstaller CLI Build Command
 -------------------------------------
