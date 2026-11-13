@@ -1,0 +1,8 @@
+PySide6
+numpy
+soundfile
+cryptography
+torch
+torchaudio
+huggingface_hub
+voxcpm

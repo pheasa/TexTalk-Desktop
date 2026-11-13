@@ -9,3 +9,4 @@ dist/
 build/
 *.spec
 .DS_Store
+*.db
