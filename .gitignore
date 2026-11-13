@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+outputs/*.wav
+models/VoxCPM2/*
+!models/VoxCPM2/.gitkeep
+dist/
+build/
+*.spec
+.DS_Store
